@@ -1,0 +1,61 @@
+
+# Chandilamport snapshot
+
+This README provides instructions on how to run the distributed system project using Docker.
+
+## Prerequisites
+
+- Docker installed on your system
+- Docker Compose installed on your system
+
+## Running the Project
+
+1. Build the Docker image:
+   ```
+   docker build . -t prj2
+   ```
+
+2. Start the Docker network and containers:
+   ```
+   docker-compose up
+   ```
+
+3. Stop and remove all existing containers:
+   ```
+   docker stop $(docker ps -aq)
+   docker rm $(docker ps -aq)
+   ```
+
+4. Run the new containers:
+   ```
+   docker run --name container1 --network prj2_network --hostname container1 prj2 -h hostfile.txt -t 0.2 -m 2 -s 2 -p 1 -x &
+   docker run --name container2 --network prj2_network --hostname container2 prj2 -h hostfile.txt -t 0.2 -m 2 &
+   docker run --name container3 --network prj2_network --hostname container3 prj2 -h hostfile.txt -t 0.2 -m 2 -s 30&
+   docker run --name container4 --network prj2_network --hostname container4 prj2 -h hostfile.txt -t 0.2 -m 2 &
+   docker run --name container5 --network prj2_network --hostname container5 prj2 -h hostfile.txt -t 0.2 -m 2 &
+   ```
+
+## Alternative Method: Using run_project.sh
+
+You can also use the provided `run_project.sh` script to run the project. To do this:
+
+1. Make sure the script is executable:
+   ```
+   chmod +x run_project.sh
+   ```
+
+2. Run the script:
+   ```
+   ./run_project.sh
+   ```
+
+You can modify the `run_project.sh` script to adjust the parameters or add more containers as needed.
+
+## Note for Best Results
+
+For the best results and clearer output, it's recommended to run each process in a separate terminal. This allows you to see the output of each process individually without overlapping. To do this:
+
+1. Open five separate terminal windows.
+2. In each terminal, run one of the `docker run` commands from step 4 above, without the `&` at the end.
+
+

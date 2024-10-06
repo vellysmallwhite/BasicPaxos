@@ -1,0 +1,40 @@
+version: '3'
+services:
+  container1:
+    image: prj2
+    hostname: container1
+    networks:
+      - prj2_network
+    command: -h /app/hostsfile.txt -t 0.2 -x
+
+  container2:
+    image: prj2
+    hostname: container2
+    networks:
+      - prj2_network
+    command: -h /app/hostsfile.txt -t 0.2
+
+  container3:
+    image: prj2
+    hostname: container3
+    networks:
+      - prj2_network
+    command: -h /app/hostsfile.txt -t 0.2
+
+  container4:
+    image: prj2
+    hostname: container4
+    networks:
+      - prj2_network
+    command: -h /app/hostsfile.txt -t 0.2
+
+  container5:
+    image: prj2
+    hostname: container5
+    networks:
+      - prj2_network
+    command: -h /app/hostsfile.txt -t 0.2
+
+networks:
+  prj2_network:
+    driver: bridge
