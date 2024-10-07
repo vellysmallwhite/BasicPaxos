@@ -358,6 +358,11 @@ private:
             hasToken = true;
             std::cerr << "{proc_id: " << id << ", state: " << state << "}" << std::endl;
             state++;
+            if (state==snapshotTriggerState){
+            handleMarker(-1, currentSnapshotId);
+            }
+            
+
         } else if (msg.type == MARKER) {
             handleMarker(senderId, msg.snapshotId);
         }
@@ -382,11 +387,17 @@ private:
 
     void handleMarker(int senderId, int snapshotId) {
         if (!snapshotInProgress) {
+            
             snapshotInProgress = true;
             currentSnapshotId = snapshotId;
-            std::cerr << "{proc_id:" << id << ", snapshot_id: " << currentSnapshotId << ", snapshot:\"started\"}" << std::endl;
             recordLocalState();
+            std::cerr << "{proc_id:" << id << ", snapshot_id: " << snapshotId << ", snapshot:\"started\"}" << std::endl;
+            
             sendMarkers();
+
+        }
+        if (senderId==-1){
+            return;
         }
 
         channelClosed[senderId] = true;
@@ -414,14 +425,14 @@ private:
                     send(conn.second, &markerMsg, sizeof(markerMsg), 0);
                     std::cerr << "{proc_id:" << curRecord[0] << ", snapshot_id:" << curRecord[2]
               << ", sender:" << curRecord[0] << ", receiver:" << conn.first << ", msg:\"marker\", "
-              << "state:" << curRecord[1] << ", has_token:" << curRecord[3] << "}" << std::endl;
+              << "state:" << curRecord[1] << ", has_token:" << curRecord[3]<< "}" << std::endl;
                 }
             }
         }).detach();
     }
 
     void printClosedChannel(int senderId) {
-        std::cerr << "{proc_id:" << id << ", snapshot_id: " << currentSnapshotId
+        std::cerr << "{proc_id:" << id << ", snapshot_id: " << curRecord[2]
                   << ", snapshot:\"channel closed\", channel:" << senderId << "-" << id
                   << ", queue:[";
         bool first = true;
@@ -442,7 +453,7 @@ private:
     }
 
     void completeSnapshot() {
-        std::cerr << "{proc_id:" << id << ", snapshot_id: " << currentSnapshotId << ", snapshot:\"complete\"}" << std::endl;
+        std::cerr << "{proc_id:" << id << ", snapshot_id: " << curRecord[2] << ", snapshot:\"complete\"}" << std::endl;
         snapshotInProgress = false;
         for (auto& closed : channelClosed) {
              if (closed.first != id) {  // Don't reset the channel for the process itself
@@ -458,17 +469,19 @@ private:
             if (state == snapshotTriggerState && !snapshotInProgress) {
                 initiateSnapshot();
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
     }
 
     void initiateSnapshot() {
         std::lock_guard<std::mutex> lock(mutex);
+        recordLocalState();
         snapshotInProgress = true;
         currentSnapshotId = state;
-        std::cerr << "{proc_id:" << id << ", snapshot_id: " << currentSnapshotId << ", snapshot:\"started\"}" << std::endl;
-        recordLocalState();
         sendMarkers();
+        std::cerr << "{proc_id:" << id << ", snapshot_id: " << curRecord[2] << ", snapshot:\"started\"}" << std::endl;
+        //recordLocalState();
+        
     }
 };
 
