@@ -1,17 +1,21 @@
 # Use the latest gcc image as the base
 FROM gcc:latest
 
-# Set the working directory in the container
-WORKDIR /ChamdiLamport
+# Install JsonCpp library
+RUN apt-get update && apt-get install -y libjsoncpp-dev && ls /usr/include/jsoncpp
 
-# Copy the current directory contents into the container at /app
+
+# Set the working directory in the container
+WORKDIR /Paxos
+
+# Copy the current directory contents into the container at /ChamdiLamport-1
 COPY . .
 
-# Compile the C++ program
-RUN g++ -std=c++11 -o passtoken main.cpp -pthread
+# Compile the C++ program with JsonCpp
+RUN g++ -std=c++11 -o paxos main.cpp -pthread -ljsoncpp -I/usr/include/jsoncpp
 
-# Set the entry point to your application
-ENTRYPOINT ["./passtoken"]
+# Set the entry point to your application (adjust if needed)
+ENTRYPOINT ["./paxos"]
 
-# Use CMD to provide default arguments
+# Use CMD to provide default arguments (can be modified or left empty)
 CMD []

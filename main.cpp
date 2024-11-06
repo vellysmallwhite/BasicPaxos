@@ -3,7 +3,6 @@
 #include <vector>
 #include <string>
 #include <map>
-#include <queue>
 #include <thread>
 #include <chrono>
 #include <mutex>
@@ -16,280 +15,465 @@
 #include <getopt.h>
 #include <algorithm>
 #include <errno.h>
-#include <netdb.h> // Needed for gethostbyname
-
+#include <netdb.h>
+#include <json/json.h>
+#include <sstream>
+#include <semaphore.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 const int PORT = 8080;
 
-enum MessageType { TOKEN, MARKER };
-
-struct Message {
-    MessageType type;
-    int snapshotId;
+const char* SEM_NAME = "/console_semaphore"; 
+enum Role {
+    PROPOSER,
+    ACCEPTOR,
+    LEARNER
 };
 
-class Process {
+enum MessageType {
+    PREPARE,
+    PROMISE,
+    ACCEPT,
+    ACCEPTED,
+    CHOSEN,
+    NACK
+};
+
+struct PeerConfig {
+    std::string hostname;
+    std::vector<std::string> roles;
+};
+
+class PaxosProcess {
 private:
     int id;
-    std::atomic<int> state;
-    int predecessor;
-    int successor;
+    std::string hostname;
+    std::vector<std::string> roles;
+    int proposalNum;
+    int highestProposalNumSeen;
+    int acceptedProposalNum;  // vrnd
+    char acceptedValue;       // vval
+    int lastPromisedProposalNum;  // last_rnd
+    int delay;
+    std::vector<std::string> peers;
+    std::map<int, PeerConfig> peerConfigs;
+    std::vector<int> myAcceptors;
+    std::vector<int> myLearners;
     std::map<int, int> incomingConnections;
     std::map<int, int> outgoingConnections;
-    std::atomic<bool> hasToken;
-    float tokenDelay;
-    float markerDelay;
-    std::vector<std::string> hosts;
     std::atomic<bool> running;
-    std::thread listenThread;
-    std::thread tokenThread;
-    std::thread snapshotThread;
-    std::mutex mutex;
-    std::map<int, std::queue<Message>> snapshotQueues;
+    std::thread messageThread;
+    std::mutex mtx;
+    int serverSocket;
+    std::map<int, int> prepareResponses;
+    std::map<int, int> acceptResponses;
     std::map<int, bool> channelClosed;
-    int currentSnapshotId;
-    std::atomic<bool> snapshotInProgress;
-    int snapshotTriggerState;
-    std::string hostname;
-    std::string curRecord[4];
-    int serverSocket;  // Single server socket for incoming connections
-
+    std::map<int, char> promisedValues;  // Keep track of accepted values from promises
+    char valueToPropose;
+    sem_t* consoleSemaphore; // Pointer to named semaphore
+    std::ofstream logFile; 
 public:
-    Process(int id, const std::vector<std::string>& hosts, bool startWithToken,
-            float tokenDelay, float markerDelay, int snapshotTriggerState,
-            int snapshotId, const std::string& hostname)
-        : id(id), state(startWithToken ? 1 : 0), hasToken(startWithToken),
-          tokenDelay(tokenDelay), markerDelay(markerDelay),
-          hosts(hosts), running(true), snapshotInProgress(false),
-          snapshotTriggerState(snapshotTriggerState), currentSnapshotId(snapshotId),
-          hostname(hostname) {
-        int numProcesses = hosts.size();
-        predecessor = mod(id - 2, numProcesses) + 1;
-        successor = mod(id, numProcesses) + 1;
-        for (int i = 1; i <= numProcesses; ++i) {
-            
-                 channelClosed[i] = true;
-            
+    PaxosProcess(const std::string& configFile, int delay, const std::string& hostname)
+        : hostname(hostname), delay(delay), running(true), proposalNum(0),
+          highestProposalNumSeen(0), acceptedProposalNum(0), acceptedValue('\0'),
+          lastPromisedProposalNum(0), valueToPropose('\0') {
+        readConfigFile(configFile);
+        consoleSemaphore = sem_open(SEM_NAME, O_CREAT, 0644, 1);
+        if (consoleSemaphore == SEM_FAILED) {
+            perror("sem_open");
+            exit(EXIT_FAILURE);
         }
-        std::cerr << "{proc_id: " << id << ", state: " << state
-                  << ", predecessor: " << predecessor << ", successor: " << successor << "}" << std::endl;
+
+        
+    }
+      ~PaxosProcess() {
+        // Close the semaphore and unlink if needed
+        sem_close(consoleSemaphore);
+        sem_unlink(SEM_NAME);
     }
 
-    void run() {
+    void run(char value) {
+        valueToPropose = value;
         setupConnections();
-        if (hasToken) {
-            std::cerr << "{proc_id: " << id << ", state: " << state << "}" << std::endl;
+        waitForConnections();
+        if (isProposer()) {
+            if (delay > 0) {
+                std::this_thread::sleep_for(std::chrono::seconds(delay));
+            }
+            initiateProposal();
         }
-        listenThread = std::thread(&Process::listenForMessages, this);
-        tokenThread = std::thread(&Process::tokenPassingTask, this);
-        snapshotThread = std::thread(&Process::snapshotInitiationTask, this);
-
-        tokenThread.join();
-        snapshotThread.join();
-        listenThread.join();
+        messageThread = std::thread(&PaxosProcess::listenForMessages, this);
+        messageThread.join();
     }
 
 private:
-    int mod(int a, int b) {
-        return (a % b + b) % b;
+
+    void safePrintJson(const Json::Value& json) {
+        // Convert JSON to a single-line string
+        std::ostringstream oss;
+    oss << "{\"peer_id\":" << id
+        << ", \"action\":\"" << json["action"].asString()
+        << "\", \"message_type\":\"" << json["message_type"].asString()
+        << "\", \"message_value\":\"" << json["message_value"].asString()
+        << "\", \"proposal_num\":" << json["proposal_num"].asInt() << "}";
+
+    // Output the formatted JSON string
+    std::string output = oss.str() + "\n";  // Add newline for clarity between messages
+    write(STDOUT_FILENO, output.c_str(), output.size());
     }
 
-    void tokenPassingTask() {
-        while (running) {
-            if (hasToken && !isOutgoingChannelEmpty()) {
-                passToken();
+
+    bool isProposer() {
+        for (const auto& role : roles) {
+            if (role.find("proposer") != std::string::npos) {
+                return true;
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(10)); // Short sleep to prevent busy-waiting
         }
+        return false;
     }
 
-    bool isOutgoingChannelEmpty() {
-        std::lock_guard<std::mutex> lock(mutex);
-        return outgoingConnections.find(successor) == outgoingConnections.end();
+    bool isAcceptor() {
+        for (const auto& role : roles) {
+            if (role.find("acceptor") != std::string::npos) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool isLearner() {
+        for (const auto& role : roles) {
+            if (role.find("learner") != std::string::npos) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void waitForConnections() {
+        bool allConnected = false;
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        while (!allConnected && running) {
+            std::lock_guard<std::mutex> lock(mtx);
+            allConnected = true;
+
+            if (isProposer()) {
+                for (int acceptorId : myAcceptors) {
+                    if (outgoingConnections.find(acceptorId) == outgoingConnections.end()) {
+                        allConnected = false;
+                        break;
+                    }
+                }
+            }
+
+            if (!allConnected) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+            }
+        }
+
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+
+        //std::cerr << hostname << " All necessary connections established" << std::endl;
+    }
+
+    void readConfigFile(const std::string& configFile) {
+        std::ifstream file(configFile);
+        if (!file.is_open()) {
+            throw std::runtime_error("Unable to open config file: " + configFile);
+        }
+
+        std::string line;
+        int lineNum = 0;
+        while (std::getline(file, line)) {
+            lineNum++;
+            if (line.empty() || line[0] == '#') continue;
+
+            size_t colonPos = line.find(':');
+            if (colonPos == std::string::npos) {
+                throw std::runtime_error("Invalid format in config file at line " + std::to_string(lineNum));
+            }
+            std::string host = line.substr(0, colonPos);
+            std::string rolesStr = line.substr(colonPos + 1);
+
+            PeerConfig config;
+            config.hostname = host;
+
+            std::istringstream rolesStream(rolesStr);
+            std::string roleToken;
+            while (std::getline(rolesStream, roleToken, ',')) {
+                config.roles.push_back(roleToken);
+            }
+
+            int peerId = peerConfigs.size() + 1;
+            peerConfigs[peerId] = config;
+            peers.push_back(host);
+
+            if (config.hostname == hostname) {
+                id = peerId;
+                roles = config.roles;
+            }
+        }
+
+        if (id == 0) {
+            throw std::runtime_error("This host (" + hostname + ") not found in config file");
+        }
+
+        // For proposers, set myAcceptors based on acceptor roles
+        for (const auto& role : roles) {
+            if (role.find("proposer") != std::string::npos) {
+                std::string proposerRole = role;
+                // Find acceptors assigned to this proposer
+                for (const auto& peerPair : peerConfigs) {
+                    int peerId = peerPair.first;
+                    const PeerConfig& config = peerPair.second;
+                    if (peerId == id) continue;
+                    if (std::find(config.roles.begin(), config.roles.end(), "acceptor" + proposerRole.substr(8)) != config.roles.end()) {
+                        myAcceptors.push_back(peerId);
+                    }
+                }
+            }
+        }
+
+        // For learners
+        for (const auto& peerPair : peerConfigs) {
+            int peerId = peerPair.first;
+            const PeerConfig& config = peerPair.second;
+            if (peerId == id) continue;
+            if (std::find(config.roles.begin(), config.roles.end(), "learner") != config.roles.end()) {
+                myLearners.push_back(peerId);
+            }
+        }
+
+        std::cerr << "Configuration loaded for process " << id << " with roles: ";
+        for (const auto& role : roles) {
+            std::cerr << role << " ";
+        }
+        std::cerr << std::endl;
     }
 
     void setupConnections() {
-        // Create a single server socket for incoming connections
         serverSocket = socket(AF_INET, SOCK_STREAM, 0);
         if (serverSocket == -1) {
-            throw std::runtime_error("Failed to create server socket");
+            throw std::runtime_error("Server socket creation failed");
         }
 
-        // Set server address and bind it to the process port (PORT + id)
+        int opt = 1;
+        if (setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+            throw std::runtime_error("setsockopt failed");
+        }
+
         sockaddr_in serverAddr;
         serverAddr.sin_family = AF_INET;
-        serverAddr.sin_addr.s_addr = inet_addr("0.0.0.0");
-        serverAddr.sin_port = htons(PORT + id);  // Unique port for each process
+        serverAddr.sin_addr.s_addr = INADDR_ANY;
+        serverAddr.sin_port = htons(PORT + id);
 
         if (bind(serverSocket, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
-            throw std::runtime_error("Failed to bind server socket to port " + std::to_string(PORT + id));
+            throw std::runtime_error("Bind failed");
         }
 
-        if (listen(serverSocket, 5) < 0) {
-            throw std::runtime_error("Failed to listen on server socket");
+        if (listen(serverSocket, 10) < 0) {
+            throw std::runtime_error("Listen failed");
         }
 
-        std::cerr << hostname << " Server listening on port " << PORT + id << std::endl;
-
-        // Start a thread to accept incoming connections
-        std::thread acceptThread(&Process::acceptConnections, this);
-        acceptThread.detach();
-
-        // Establish outgoing connections to other processes
-        std::thread connectThread(&Process::establishOutgoingConnections, this);
-        connectThread.detach();
+        std::thread(&PaxosProcess::acceptIncomingConnections, this).detach();
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        std::thread(&PaxosProcess::establishOutgoingConnections, this).detach();
     }
 
-    void acceptConnections() {
+    void acceptIncomingConnections() {
         while (running) {
             sockaddr_in clientAddr;
-            socklen_t clientAddrLen = sizeof(clientAddr);
-            int clientSocket = accept(serverSocket, (struct sockaddr*)&clientAddr, &clientAddrLen);
+            socklen_t addrLen = sizeof(clientAddr);
+            int clientSocket = accept(serverSocket, (struct sockaddr*)&clientAddr, &addrLen);
+
             if (clientSocket < 0) {
-                if (errno == EINTR) continue; // Interrupted by signal, retry
-                std::cerr << "Failed to accept client connection" << std::endl;
+                if (errno != EINTR) {
+                    std::cerr << "Accept failed: " << strerror(errno) << std::endl;
+                }
                 continue;
             }
 
-            // Receive the client's process ID (senderId)
             int senderId;
-            int bytesReceived = recv(clientSocket, &senderId, sizeof(senderId), MSG_WAITALL);
-            if (bytesReceived <= 0) {
+            if (recv(clientSocket, &senderId, sizeof(senderId), MSG_WAITALL) <= 0) {
                 close(clientSocket);
                 continue;
             }
 
-            // Store the incoming connection based on sender's ID
             {
-                std::lock_guard<std::mutex> lock(mutex);
+                std::lock_guard<std::mutex> lock(mtx);
+                if (incomingConnections.find(senderId) != incomingConnections.end()) {
+                    close(incomingConnections[senderId]);
+                }
                 incomingConnections[senderId] = clientSocket;
                 channelClosed[senderId] = false;
             }
-
-            std::cerr << id << ": Established incoming connection from process " << senderId << std::endl;
         }
     }
 
     void establishOutgoingConnections() {
-        int numProcesses = hosts.size();
+        int numProcesses = peers.size();
         while (running) {
             for (int i = 1; i <= numProcesses; ++i) {
-                if (i != id) {  // Make sure not to connect to yourself
+                if (i != id) {
                     bool needToConnect = false;
                     int clientSocket = -1;
 
-                    // Check if the connection exists
                     {
-                        std::lock_guard<std::mutex> lock(mutex);
+                        std::lock_guard<std::mutex> lock(mtx);
                         auto it = outgoingConnections.find(i);
                         if (it == outgoingConnections.end()) {
-                            // If not found, we need to establish a new connection
                             needToConnect = true;
                         } else {
-                            // Check if the existing connection is still valid
                             clientSocket = it->second;
                         }
                     }
 
                     if (needToConnect) {
-                        // Establish a new connection outside of the mutex
                         establishOutgoingConnection(i);
                     } else if (clientSocket != -1) {
-                        // Check if the existing connection is still valid
                         char buffer;
                         int result = recv(clientSocket, &buffer, 1, MSG_PEEK | MSG_DONTWAIT);
 
                         if (result == 0 || (result == -1 && errno != EAGAIN && errno != EWOULDBLOCK)) {
                             std::cerr << hostname << " Connection to process " << i << " is broken. Reconnecting..." << std::endl;
-                            close(clientSocket);  // Close the broken socket
+                            close(clientSocket);
                             {
-                                std::lock_guard<std::mutex> lock(mutex);
-                                outgoingConnections.erase(i);  // Remove the broken connection
+                                std::lock_guard<std::mutex> lock(mtx);
+                                outgoingConnections.erase(i);
                             }
-                            // Try to re-establish the connection
                             establishOutgoingConnection(i);
                         }
                     }
                 }
             }
-            std::this_thread::sleep_for(std::chrono::seconds(1));  // Retry every 1 second
+            std::this_thread::sleep_for(std::chrono::seconds(1));
         }
     }
 
-
     void establishOutgoingConnection(int targetId) {
-    if (targetId == id) {
-        std::cerr << "Skipping self-connection for process " << id << std::endl;
-        return;
+        if (targetId == id) {
+            std::cerr << "Skipping self-connection for process " << id << std::endl;
+            return;
+        }
+
+        int clientSocket = socket(AF_INET, SOCK_STREAM, 0);
+        if (clientSocket == -1) {
+            std::cerr << "Failed to create client socket" << std::endl;
+            return;
+        }
+
+        sockaddr_in serverAddr;
+        serverAddr.sin_family = AF_INET;
+        serverAddr.sin_port = htons(PORT + targetId);
+
+        std::string targetHostname = peers[targetId - 1];
+
+        struct addrinfo hints, *res;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+
+        int status = getaddrinfo(targetHostname.c_str(), nullptr, &hints, &res);
+        if (status != 0) {
+            close(clientSocket);
+            return;
+        }
+
+        struct sockaddr_in* resolvedAddr = (struct sockaddr_in*)res->ai_addr;
+        serverAddr.sin_addr = resolvedAddr->sin_addr;
+
+        if (connect(clientSocket, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
+            close(clientSocket);
+            freeaddrinfo(res);
+            return;
+        }
+
+        send(clientSocket, &id, sizeof(id), 0);
+
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            outgoingConnections[targetId] = clientSocket;
+        }
+
+        std::cerr << hostname << " Established outgoing connection to process "
+                  << targetHostname << " on port " << PORT + targetId << std::endl;
+
+        freeaddrinfo(res);
     }
 
-    int clientSocket = socket(AF_INET, SOCK_STREAM, 0);
-    if (clientSocket == -1) {
-        std::cerr << "Failed to create client socket" << std::endl;
-        return;
+    void initiateProposal() {
+        proposalNum = generateProposalNumber();
+        highestProposalNumSeen = proposalNum;
+        sendPrepare();
     }
 
-    sockaddr_in serverAddr;
-    serverAddr.sin_family = AF_INET;
-    serverAddr.sin_port = htons(PORT + targetId);  // Use targetId to connect to the correct port
-
-    // Use the Docker container name (hostname) directly
-    std::string targetHostname = hosts[targetId - 1];
-
-    // Resolve the hostname (container name) using getaddrinfo
-    struct addrinfo hints, *res;
-    memset(&hints, 0, sizeof(hints));  // Zero out the hints struct
-    hints.ai_family = AF_INET;         // IPv4
-    hints.ai_socktype = SOCK_STREAM;   // TCP
-
-    // Attempt to resolve the hostname
-    int status = getaddrinfo(targetHostname.c_str(), nullptr, &hints, &res);
-    if (status != 0) {
-        //std::cerr << hostname << " Failed to resolve address for process " << targetId << ": " << gai_strerror(status) << std::endl;
-        close(clientSocket);
-        return;
+    int generateProposalNumber() {
+        // Generate a unique proposal number
+        static int uniqueId = id * 1000;  // Ensure uniqueness across processes
+        return ++uniqueId;
     }
 
-    // Use the first resolved address
-    struct sockaddr_in* resolvedAddr = (struct sockaddr_in*)res->ai_addr;
-    serverAddr.sin_addr = resolvedAddr->sin_addr;
-
-    // Attempt to connect to the target process
-    if (connect(clientSocket, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
-        //std::cerr << "Failed to connect to process " << targetId 
-                  //<< " on port " << PORT + targetId << ". Will retry later." << std::endl;
-        close(clientSocket);
-        freeaddrinfo(res);  // Free the result of getaddrinfo
-        return;
+    void sendPrepare() {
+        Json::Value msg(Json::objectValue); 
+        msg["peer_id"] = id;
+        msg["action"] = "sent";
+        msg["message_type"] = "prepare";
+        msg["message_value"] = std::string(1, valueToPropose);
+        msg["proposal_num"] = proposalNum;
+        broadcastToAcceptors(msg);
     }
 
-    // Send the current process ID to the target process
-    send(clientSocket, &id, sizeof(id), 0);
+    void broadcastToAcceptors(const Json::Value& msg) {
+        std::string msgStr = msg.toStyledString();
+        //safePrintJson(msgStr);
+        //std::cout << msgStr << std::endl;
+        safePrintJson(msg);
 
-    // Store the outgoing connection in the map
-    {std::lock_guard<std::mutex> lock(mutex);
-    outgoingConnections[targetId] = clientSocket;}
+        std::lock_guard<std::mutex> lock(mtx);
 
-    std::cerr << hostname << " Established outgoing connection to process " 
-              << targetHostname << " on port " << PORT + targetId << std::endl;
+        for (int acceptorId : myAcceptors) {
+            if (outgoingConnections.find(acceptorId) != outgoingConnections.end()) {
+                send(outgoingConnections[acceptorId], msgStr.c_str(), msgStr.size(), 0);
+            }
+        }
+    }
 
-    // Free the result of getaddrinfo
-    freeaddrinfo(res);
-}
+    void sendMessage(const Json::Value& msg, int targetId) {
+        std::string msgStr = msg.toStyledString();
+
+        //std::cout << msgStr << std::endl;
+        safePrintJson(msg);
+
+        std::lock_guard<std::mutex> lock(mtx);
+        if (outgoingConnections.find(targetId) != outgoingConnections.end()) {
+            send(outgoingConnections[targetId], msgStr.c_str(), msgStr.size(), 0);
+        }
+    }
+
+    void sendToAll(const Json::Value& msg) {
+        std::string msgStr = msg.toStyledString();
+
+        //std::cout << msgStr << std::endl;
+        safePrintJson(msg);
+
+        std::lock_guard<std::mutex> lock(mtx);
+        for (const auto& conn : outgoingConnections) {
+            send(conn.second, msgStr.c_str(), msgStr.size(), 0);
+        }
+    }
 
     void listenForMessages() {
         while (running) {
             fd_set readfds;
             FD_ZERO(&readfds);
-
             int max_sd = -1;
 
-            // Add incoming sockets to the read set
             {
-                std::lock_guard<std::mutex> lock(mutex);
+                std::lock_guard<std::mutex> lock(mtx);
                 for (const auto& conn : incomingConnections) {
                     FD_SET(conn.second, &readfds);
-                    if (conn.second > max_sd) max_sd = conn.second;
+                    max_sd = std::max(max_sd, conn.second);
                 }
             }
 
@@ -298,270 +482,295 @@ private:
                 continue;
             }
 
-            // Set a timeout for select()
-            struct timeval timeout;
-            timeout.tv_sec = 0;
-            timeout.tv_usec = 100000; // 100ms timeout
+            timeval timeout = {1, 0};
+            int activity = select(max_sd + 1, &readfds, nullptr, nullptr, &timeout);
 
-            int activity = select(max_sd + 1, &readfds, NULL, NULL, &timeout);
-
-            if (activity < 0) {
-                if (errno == EINTR) continue;
+            if (activity < 0 && errno != EINTR) {
                 std::cerr << "Select error" << std::endl;
                 continue;
             }
 
-            // Handle incoming messages on established client connections
+            std::map<int, int> currentConnections;
             {
-                std::map<int, int> localIncomingConnections;
-{
-    std::lock_guard<std::mutex> lock(mutex);
-    localIncomingConnections = incomingConnections;
+                std::lock_guard<std::mutex> lock(mtx);
+                currentConnections = incomingConnections;
+            }
+
+            for (const auto& conn : currentConnections) {
+    if (FD_ISSET(conn.second, &readfds)) {
+        char buffer[1024] = {0};
+        int bytesRead = read(conn.second, buffer, 1024);
+
+        if (bytesRead > 0) {
+            Json::Reader reader;
+            Json::Value receivedMsg;
+            if (reader.parse(buffer, receivedMsg)) {
+                // Print received message
+                receivedMsg["action"] = "received";
+                //std::cout << receivedMsg.toStyledString() << std::endl;
+                safePrintJson(receivedMsg);
+
+                int senderId = receivedMsg["peer_id"].asInt();
+                MessageType msgType = parseMessageType(
+                    receivedMsg["message_type"].asString());
+                int propNum = receivedMsg["proposal_num"].asInt();
+                char value = receivedMsg["message_value"].asString()[0];
+                handleMessage(senderId, msgType, propNum, value);
+            }
+        }
+    }
 }
-                std::vector<int> disconnected;
-                for (const auto& conn : localIncomingConnections) {
-                    if (FD_ISSET(conn.second, &readfds)) {
-                        Message msg;
-                        int bytesRead = recv(conn.second, &msg, sizeof(msg), 0);
-                        if (bytesRead <= 0) {
-                            // Handle disconnection or error
-                            close(conn.second);
-                            disconnected.push_back(conn.first);
-                            std::cerr << "Client " << conn.first << " disconnected" << std::endl;
-                        } else {
-                            handleMessage(msg, conn.first);  // Process the received message
-                        }
-                    }
-                }
-                // Remove disconnected sockets
-                for (int pid : disconnected) {
-                    std::lock_guard<std::mutex> lock(mutex);
-                    incomingConnections.erase(pid);
-                    channelClosed[pid]=true;
-                }
+        }
+    }
+
+    MessageType parseMessageType(const std::string& type) {
+        if (type == "prepare") return PREPARE;
+        if (type == "prepare_ack") return PROMISE;
+        if (type == "accept") return ACCEPT;
+        if (type == "accept_ack") return ACCEPTED;
+        if (type == "chosen") return CHOSEN;
+        if (type == "nack") return NACK;
+        throw std::invalid_argument("Unknown message type: " + type);
+    }
+
+    void handleMessage(int senderId, MessageType msgType, int propNum, char value) {
+        switch (msgType) {
+            case PREPARE:
+                handlePrepare(senderId, propNum);
+                break;
+            case PROMISE:
+                handlePromise(senderId, propNum, value);
+                break;
+            case ACCEPT:
+                handleAcceptRequest(senderId, propNum, value);
+                break;
+            case ACCEPTED:
+                handleAccepted(senderId, propNum, value);
+                break;
+            case NACK:
+                handleNack(senderId, propNum);
+                break;
+            case CHOSEN:
+                handleChosen(senderId, propNum, value);
+                break;
+        }
+    }
+
+    void handlePrepare(int senderId, int propNum) {
+        if (isAcceptor()) {
+            if (propNum < lastPromisedProposalNum) {
+                sendNack(senderId, lastPromisedProposalNum);
+                return;
             }
+
+            lastPromisedProposalNum = propNum;
+
+            Json::Value promiseMsg(Json::objectValue); 
+            promiseMsg["peer_id"] = id;
+            promiseMsg["action"] = "sent";
+            promiseMsg["message_type"] = "prepare_ack";
+            promiseMsg["message_value"] = std::string(1, acceptedValue ? acceptedValue : ' ');
+            promiseMsg["proposal_num"] = propNum;
+            promiseMsg["accepted_proposal_num"] = acceptedProposalNum;
+
+            sendMessage(promiseMsg, senderId);
         }
     }
 
-    void handleMessage(const Message& msg, int senderId) {
-        std::lock_guard<std::mutex> lock(mutex);
-        std::cerr << "{proc_id: " << id << ", received_message: " << (msg.type == TOKEN ? "token" : "marker")
-                  << ", from: " << senderId << "}" << std::endl;
+    void sendNack(int senderId, int propNum) {
+        Json::Value nackMsg;
+        nackMsg["peer_id"] = id;
+        nackMsg["action"] = "sent";
+        nackMsg["message_type"] = "nack";
+        nackMsg["message_value"] = " ";
+        nackMsg["proposal_num"] = lastPromisedProposalNum;
 
-        // if (channelClosed[senderId]) {
-        //     return;
-        // }
-        if (msg.type == TOKEN) {
-            if (snapshotInProgress&&!channelClosed[senderId]) {
-                snapshotQueues[senderId].push(msg);
-            }
-            hasToken = true;
-            std::cerr << "{proc_id: " << id << ", state: " << state << "}" << std::endl;
-            state++;
-            if (state==snapshotTriggerState){
-            handleMarker(-1, currentSnapshotId);
-            }
-            
-
-        } else if (msg.type == MARKER) {
-            handleMarker(senderId, msg.snapshotId);
-        }
+        sendMessage(nackMsg, senderId);
     }
 
-    void passToken() {
-        std::this_thread::sleep_for(std::chrono::duration<float>(tokenDelay));
+    void handlePromise(int senderId, int propNum, char value) {
+    if (!isProposer()) return;
 
-        std::lock_guard<std::mutex> lock(mutex);
-        if (outgoingConnections.find(successor) != outgoingConnections.end()) {
-            Message tokenMsg = {TOKEN, 0};
-            send(outgoingConnections[successor], &tokenMsg, sizeof(tokenMsg), 0);
-            std::cerr << "{proc_id: " << id << ", state: " << state << "}" << std::endl;
-            std::cerr << "{proc_id: " << id << ", sender: " << id << ", receiver: " << successor
-                      << ", message:\"token\"}" << std::endl;
-            hasToken = false;
-        } else {
-            // Cannot pass token because outgoing connection is not established yet
-            std::cerr << "{proc_id: " << id << ", message:\"Cannot pass token, no outgoing connection to " << successor << "\"}" << std::endl;
-        }
-    }
+    if (propNum != proposalNum) return;
 
-    void handleMarker(int senderId, int snapshotId) {
-        if (!snapshotInProgress) {
-            
-            snapshotInProgress = true;
-            currentSnapshotId = snapshotId;
-            recordLocalState();
-            std::cerr << "{proc_id:" << id << ", snapshot_id: " << snapshotId << ", snapshot:\"started\"}" << std::endl;
-            
-            sendMarkers();
+    bool quorumReached = false;
+    char valueToSend = valueToPropose;
+    int highestAcceptedProposalNum = 0;
 
-        }
-        if (senderId==-1){
-            return;
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        prepareResponses[senderId] = propNum;
+        if (value != ' ') {
+            promisedValues[senderId] = value;
         }
 
-        channelClosed[senderId] = true;
-        printClosedChannel(senderId);
+        // Check if quorum has been reached
+        if (prepareResponses.size() ==myAcceptors.size()/2) {
+            quorumReached = true;
 
-        if (allChannelsClosed()) {
-            completeSnapshot();
-        }
-    }
+            // Determine the value to send based on highest accepted proposal number
+            for (const auto& pair : promisedValues) {
+                acceptedProposalNum = prepareResponses[pair.first];
 
-    void recordLocalState() {
-        curRecord[0] = std::to_string(id);  // proc_id
-    curRecord[1] = std::to_string(state);  // state
-    curRecord[2] = std::to_string(currentSnapshotId);  // snapshot_id
-    curRecord[3] = (hasToken ? "YES" : "NO"); 
-    }
-    void sendMarkers() {
-        std::thread([this]() {
-            std::this_thread::sleep_for(std::chrono::duration<float>(markerDelay));
-
-            std::lock_guard<std::mutex> lock(mutex);
-            for (const auto& conn : outgoingConnections) {
-                if (conn.first != id) {
-                    Message markerMsg = {MARKER, currentSnapshotId};
-                    send(conn.second, &markerMsg, sizeof(markerMsg), 0);
-                    std::cerr << "{proc_id:" << curRecord[0] << ", snapshot_id:" << curRecord[2]
-              << ", sender:" << curRecord[0] << ", receiver:" << conn.first << ", msg:\"marker\", "
-              << "state:" << curRecord[1] << ", has_token:" << curRecord[3]<< "}" << std::endl;
+                if (acceptedProposalNum > highestAcceptedProposalNum) {
+                    highestAcceptedProposalNum = acceptedProposalNum+1;
+                    valueToSend = pair.second;
                 }
             }
-        }).detach();
-    }
 
-    void printClosedChannel(int senderId) {
-        std::cerr << "{proc_id:" << id << ", snapshot_id: " << curRecord[2]
-                  << ", snapshot:\"channel closed\", channel:" << senderId << "-" << id
-                  << ", queue:[";
-        bool first = true;
-        while (!snapshotQueues[senderId].empty()) {
-            if (!first) std::cerr << ",";
-            std::cerr << (snapshotQueues[senderId].front().type == TOKEN ? "token" : "marker");
-            snapshotQueues[senderId].pop();
-            first = false;
-        }
-        std::cerr << "]}" << std::endl;
-    }
-
-    bool allChannelsClosed() {
-        for (const auto& closed : channelClosed) {
-            if (!closed.second) return false;
-        }
-        return true;
-    }
-
-    void completeSnapshot() {
-        std::cerr << "{proc_id:" << id << ", snapshot_id: " << curRecord[2] << ", snapshot:\"complete\"}" << std::endl;
-        snapshotInProgress = false;
-        for (auto& closed : channelClosed) {
-             if (closed.first != id) {  // Don't reset the channel for the process itself
-        closed.second = false;
-    }
-           
-        }
-        snapshotQueues.clear();
-    }
-
-    void snapshotInitiationTask() {
-        while (running) {
-            if (state == snapshotTriggerState && !snapshotInProgress) {
-                initiateSnapshot();
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            // Clear response tracking after quorum is reached
+            prepareResponses.clear();
+            promisedValues.clear();
         }
     }
 
-    void initiateSnapshot() {
-        std::lock_guard<std::mutex> lock(mutex);
-        recordLocalState();
-        snapshotInProgress = true;
-        currentSnapshotId = state;
-        sendMarkers();
-        std::cerr << "{proc_id:" << id << ", snapshot_id: " << curRecord[2] << ", snapshot:\"started\"}" << std::endl;
-        //recordLocalState();
+    // Send the accept request outside of the lock to avoid deadlock
+    if (quorumReached) {
+        sendAcceptRequest(proposalNum, valueToSend);
+    }
+}
+
+
+    void handleNack(int senderId, int propNum) {
+        if (!isProposer()) return;
+
+        if (propNum != proposalNum) return;
+
+        // Start new proposal with higher proposal number
+        proposalNum = generateProposalNumber();
+        highestProposalNumSeen = proposalNum;
+        sendPrepare();
+    }
+
+    void sendAcceptRequest(int propNum, char value) {
+        Json::Value msg(Json::objectValue);
         
+        msg["peer_id"] = id;
+        msg["action"] = "sent";
+        msg["message_type"] = "accept";
+        msg["message_value"] = std::string(1, value);
+        msg["proposal_num"] = propNum;
+        broadcastToAcceptors(msg);
+    }
+
+    void handleAcceptRequest(int senderId, int propNum, char value) {
+        if (isAcceptor()||isLearner()) {
+            if (propNum < lastPromisedProposalNum) {
+                sendNack(senderId, lastPromisedProposalNum);
+                return;
+            }
+
+            lastPromisedProposalNum = propNum;
+            acceptedProposalNum = propNum;
+            acceptedValue = value;
+
+            Json::Value acceptedMsg;
+            acceptedMsg["peer_id"] = id;
+            acceptedMsg["action"] = "sent";
+            acceptedMsg["message_type"] = "accept_ack";
+            acceptedMsg["message_value"] = std::string(1, value);
+            acceptedMsg["proposal_num"] = propNum;
+            //handleChosen(id, propNum,  acceptedValue);
+
+            sendMessage(acceptedMsg, senderId);
+
+            // Notify learners
+            
+        }
+    }
+
+    void handleAccepted(int senderId, int propNum, char value) {
+        if (!isProposer()) return;
+
+        if (propNum != proposalNum) {proposalNum=propNum+1; return;}
+
+        std::lock_guard<std::mutex> lock(mtx);
+        acceptResponses[senderId] = propNum;
+
+        if (acceptResponses.size() > myAcceptors.size() / 2) {
+            // Majority accepted
+            Json::Value chosenMsg;
+            chosenMsg["peer_id"] = id;
+            chosenMsg["action"] = "chosen";
+            chosenMsg["message_type"] = "chosen";
+            chosenMsg["message_value"] = std::string(1, value);
+            chosenMsg["proposal_num"] = propNum;
+            safePrintJson(chosenMsg);
+            notifyLearners(propNum, value);
+            //sendToAll(chosenMsg);
+            acceptResponses.clear();
+        }
+    }
+
+    void handleChosen(int senderId, int propNum, char value) {
+        if (isLearner() || isAcceptor() || isProposer()) {
+            Json::Value chosenMsg;
+            chosenMsg["peer_id"] = id;
+            chosenMsg["action"] = "chosen";
+            chosenMsg["message_type"] = "chosen";
+            chosenMsg["message_value"] = std::string(1, value);
+            chosenMsg["proposal_num"] = propNum;
+            safePrintJson(chosenMsg);
+
+            //std::cout << chosenMsg.toStyledString() << std::endl;
+
+            //running = false;
+        }
+    }
+
+    void notifyLearners(int propNum, char value) {
+        Json::Value notifyMsg(Json::objectValue);
+        notifyMsg["peer_id"] = id;
+        notifyMsg["action"] = "sent";
+        notifyMsg["message_type"] = "accept";
+        notifyMsg["message_value"] = std::string(1, value);
+        notifyMsg["proposal_num"] = propNum;
+
+        for (int learnerId : myLearners) {
+            sendMessage(notifyMsg, learnerId);
+        }
     }
 };
 
 int main(int argc, char* argv[]) {
-    std::string hostfile;
+    std::string configFile;
     std::string hostname;
-    std::string network;
-    float tokenDelay = 0.0;
-    float markerDelay = 0.0;
-    int snapshotTriggerState = -1;
-    int snapshotId = -1;
-    bool startWithToken = false;
-
-    static struct option long_options[] = {
-        {"name", required_argument, 0, 'n'},
-        {"network", required_argument, 0, 'w'},
-        {"hostname", required_argument, 0, 'o'},
-        {0, 0, 0, 0}
-    };
+    int delay = 0;
+    char value = ' ';
 
     int opt;
-    int option_index = 0;
-    while ((opt = getopt_long(argc, argv, "h:t:m:s:p:xn:w:o:", long_options, &option_index)) != -1) {
+    while ((opt = getopt(argc, argv, "h:v:t:")) != -1) {
         switch (opt) {
             case 'h':
-                hostfile = optarg;
+                configFile = optarg;
+                break;
+            case 'v':
+                value = optarg[0];
                 break;
             case 't':
-                tokenDelay = std::stof(optarg);
-                break;
-            case 'm':
-                markerDelay = std::stof(optarg);
-                break;
-            case 's':
-                snapshotTriggerState = std::stoi(optarg);
-                break;
-            case 'p':
-                snapshotId = std::stoi(optarg);
-                break;
-            case 'x':
-                startWithToken = true;
-                break;
-            case 'n':
-            case 'o':
-                hostname = optarg;
-                break;
-            case 'w':
-                network = optarg;
+                delay = atoi(optarg);
                 break;
             default:
-                std::cerr << "Usage: " << argv[0] << " --name <hostname> --network <network> --hostname <hostname> -h <hostfile> -t <token_delay> -m <marker_delay> [-s <snapshot_delay> -p <snapshot_id>] [-x]" << std::endl;
-                return 1;
+                std::cerr << "Usage: " << argv[0] << " -h hostsfile [-v value] [-t delay]" << std::endl;
+                exit(EXIT_FAILURE);
         }
     }
 
-    if (hostname.empty()) {
-        char* envHostname = getenv("HOSTNAME");
-        if (envHostname == nullptr) {
-            std::cerr << "HOSTNAME environment variable not set" << std::endl;
-            return 1;
-        }
-        hostname = envHostname;
+    if (configFile.empty()) {
+        std::cerr << "Hosts file must be specified with -h" << std::endl;
+        exit(EXIT_FAILURE);
     }
 
-    std::ifstream file(hostfile);
-    std::vector<std::string> hosts;
-    std::string host;
-    while (std::getline(file, host)) {
-        hosts.push_back(host);
+    // Get hostname
+    char hostbuffer[256];
+    if (gethostname(hostbuffer, sizeof(hostbuffer)) == -1) {
+        perror("gethostname");
+        exit(EXIT_FAILURE);
     }
+    hostname = hostbuffer;
 
-    int id = std::distance(hosts.begin(), std::find(hosts.begin(), hosts.end(), hostname)) + 1;
-
-    if (id > hosts.size()) {
-        std::cerr << "Hostname not found in hostfile" << std::endl;
-        return 1;
-    }
-
-    Process process(id, hosts, startWithToken, tokenDelay, markerDelay, snapshotTriggerState, snapshotId, hostname);
-    process.run();
+    PaxosProcess paxosProcess(configFile, delay, hostname);
+    paxosProcess.run(value);
 
     return 0;
 }
